@@ -3,6 +3,13 @@ import sys
 import time
 import re
 
+import threading
+import asyncore
+import websocket
+import json
+import socket
+import urllib.request
+
 class BasePlugin():
     def __init__(self, src):
         self.source = src
@@ -230,3 +237,104 @@ class UnixDomainSocketDirectory(BasePlugin):
         except Exception as e:
                 print("Error finding unix domain socket: %s" % str(e), file=sys.stderr)
                 return None
+
+url_path = 'http://192.168.10.222'
+device_dic = {}
+
+class DeviceClient(asyncore.dispatcher_with_send):
+    device_id = ""
+
+    def handle_read(self):
+        data = self.recv(8192)
+        if data:
+            try:
+                js = json.loads(data.decode('utf-8'))
+                self.device_id = js["device_id"]
+                action = js["action"]
+            except Exception as e:
+                msg = '{"status": -1, "msg": "%s"}' % str(e)
+                self.send(msg.encode('utf-8'))
+                return
+
+            if action != "request":
+                msg = '{"status": -1, "msg": "not request"}'
+                self.send(msg.encode('utf-8'))
+                return
+
+            port = self.get_free_port();
+            if port is None:
+                msg = '{"status": -1, "msg": "cant alloc port"}'
+                self.send(msg.encode('utf-8'))
+                return
+
+            device_dic[self.device_id] = port
+            msg = '{"status": 0, "msg": "", data: {device_id: %s, port: %s}}' % (self.device_id, port)
+
+            self.send(msg.encode('utf-8'))
+
+            # notify java client online
+            url = url_path + '/api/device/device/editVNCStatus?deviceCode=%s&status=1' % self.device_id
+            print(url)
+            request = urllib.request.Request(url, method = 'POST')
+            reponse = urllib.request.urlopen(request).read()
+
+    def handle_close(self):
+        print('client close')
+        if self.device_id in device_dic.keys():
+            del device_dic[self.device_id]
+
+        # notify java client offline
+        url = url_path + '/api/device/device/editVNCStatus?deviceCode=%s&status=0' % self.device_id
+        print(url)
+        request = urllib.request.Request(url, method = 'POST')
+        reponse = urllib.request.urlopen(request).read()
+
+        self.close()
+
+    def get_free_port(self):
+        for port in range(20000, 30000):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = s.connect_ex(("127.0.0.1", int(port)))
+            if result:
+                if port not in device_dic.values():
+                    return port
+
+        return None
+
+
+class DeviceServer(asyncore.dispatcher):
+
+    def __init__(self, host, port):
+        asyncore.dispatcher.__init__(self)
+        self.create_socket()
+        self.set_reuse_addr()
+        self.bind((host, port))
+        self.listen(1000)
+        self.listenport = 8765
+
+    def handle_accepted(self, sock, addr):
+        print('Incoming connection from %s' % repr(addr))
+        Client = DeviceClient(sock)
+
+    def handle_close(self):
+        print('server close client')
+
+class TokenDevice(BasePlugin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._devices = {}
+        self._thread = threading.Thread(target=self.start_device_server)
+        self._thread.start()
+
+    def start_device_server(self):
+        self._server = DeviceServer("127.0.0.1", self.listenport)
+        asyncore.loop()
+
+    def lookup(self, token):
+        print("resolving token '%s'" % token, file=sys.stderr)
+        if token in device_dic.keys():
+            return ["127.0.0.1", device_dic[token]]
+        else:
+            return None
+
